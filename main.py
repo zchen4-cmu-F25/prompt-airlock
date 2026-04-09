@@ -44,8 +44,7 @@ def main(args):
         output = defense(prompt)
         jb = defense.is_jailbroken(output)
         jailbroken_results.append(jb)
-
-    print(f'We made {num_errors} errors')
+    # MARK: prompt-airlock — removed broken num_errors reference
 
     # Save results to a pandas DataFrame
     summary_df = pd.DataFrame.from_dict({
@@ -81,7 +80,7 @@ if __name__ == '__main__':
         '--target_model',
         type=str,
         default='vicuna',
-        choices=['vicuna', 'llama2']
+        choices=['vicuna', 'llama2', 'mistral']
     )
 
     # Attacking LLM

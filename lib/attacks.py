@@ -69,9 +69,20 @@ class GCG(Attack):
 
         # Clear the conv template
         conv_template.messages = []
-        
-        start_index = full_prompt.find(goal)
-        end_index = full_prompt.find(control) + len(control)
+
+        # MARK: prompt-airlock — prefer contiguous user span so Mistral/other templates
+        # still yield a valid perturbable region when goal alone is not a substring.
+        user_span = f"{goal} {control}"
+        start_index = full_prompt.find(user_span)
+        if start_index >= 0:
+            end_index = start_index + len(user_span)
+        else:
+            start_index = full_prompt.find(goal)
+            end_index = full_prompt.find(control) + len(control)
+        if start_index < 0 or end_index < start_index:
+            raise ValueError(
+                "Could not locate goal/control in rendered prompt; template may be incompatible."
+            )
         perturbable_prompt = full_prompt[start_index:end_index]
         
         return Prompt(

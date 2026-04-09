@@ -1,5 +1,6 @@
 __pycache__/
 results/
+results_semantic/
 llm-attacks/
 
 data/PAIR

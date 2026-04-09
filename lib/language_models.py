@@ -15,13 +15,16 @@ class LLM:
     ):
 
         # Language model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            use_cache=True
-        ).to(device).eval()
+        # MARK: prompt-airlock — prefer `dtype` (transformers>=4.42); fallback for older versions
+        _load_kw = dict(trust_remote_code=True, low_cpu_mem_usage=True, use_cache=True)
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path, dtype=torch.float16, **_load_kw
+            ).to(device).eval()
+        except TypeError:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path, torch_dtype=torch.float16, **_load_kw
+            ).to(device).eval()
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
