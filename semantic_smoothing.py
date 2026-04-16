@@ -9,13 +9,16 @@ Dependencies (install once):
 
 First run may download NLTK WordNet data and Helsinki-NLP Marian checkpoints (~hundreds of MB).
 
-Usage (Vicuna GCG behaviors + local Mistral):
+Usage (unified entry point recommended):
+    python main.py semantic --results_dir ./results_semantic --target_model mistral
+
+Legacy:
     python semantic_smoothing.py --results_dir ./results_semantic --target_model mistral
 
 Compare semantic vs. character-level SmoothLLM (same copy count):
-    python semantic_smoothing.py --defense both --results_dir ./results_semantic --target_model mistral
+    python main.py semantic --defense both --results_dir ./results_semantic --target_model mistral
 
-See lib/model_configs.py (MARK: prompt-airlock) for the Mistral path.
+See lib/model_configs.py (MARK: prompt-airlock) for paths; use PROMPT_AIRLOCK_CONFIG or env overrides.
 """
 
 from __future__ import annotations
@@ -23,166 +26,17 @@ from __future__ import annotations
 import argparse
 import os
 import random
-import re
-import sys
-import time
 from typing import Callable, List
-
-# Hugging Face Hub: must run before importing transformers / huggingface_hub transitively.
-def _configure_hf_hub_env() -> None:
-    if sys.platform == "win32":
-        # Avoid symlink cache on Windows (no Developer Mode); uses file copies instead of symlinks.
-        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
-    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "120")
-
-
-_configure_hf_hub_env()
 
 import numpy as np
 import pandas as pd
 import torch
-from tqdm.auto import tqdm
 
 import lib.attacks as attacks
 import lib.defenses as defenses
 import lib.language_models as language_models
 import lib.model_configs as model_configs
 
-
-MARIAN_REPO_IDS = (
-    "Helsinki-NLP/opus-mt-en-fr",
-    "Helsinki-NLP/opus-mt-fr-en",
-    "Helsinki-NLP/opus-mt-en-de",
-    "Helsinki-NLP/opus-mt-de-en",
-)
-
-
-def _prefetch_hf_snapshots(repo_ids: tuple[str, ...], max_attempts: int = 12) -> None:
-    """Warm the HF cache with full snapshot downloads to reduce transient HTTP 503 on Marian load."""
-    from huggingface_hub import snapshot_download
-
-    for repo_id in repo_ids:
-        last_err: BaseException | None = None
-        for attempt in range(max_attempts):
-            try:
-                snapshot_download(repo_id, local_files_only=False)
-                break
-            except BaseException as err:
-                last_err = err
-                wait = min(120, 2 ** min(attempt, 6))
-                time.sleep(wait)
-        else:
-            assert last_err is not None
-            raise last_err
-
-
-# --- NLTK (synonym replacement) -------------------------------------------------
-
-def _ensure_nltk_wordnet() -> None:
-    import nltk
-
-    for path, name in (
-        ("corpora/wordnet", "wordnet"),
-        ("corpora/omw-1.4", "omw-1.4"),
-    ):
-        try:
-            nltk.data.find(path)
-        except LookupError:
-            nltk.download(name, quiet=True)
-
-
-def _synonym_perturb(text: str, rng: random.Random) -> str:
-    """Lexical synonym swap via WordNet (fast, no LLM)."""
-    if not text.strip():
-        return text
-    _ensure_nltk_wordnet()
-    from nltk.corpus import wordnet as wn
-
-    tokens = text.split()
-    if not tokens:
-        return text
-
-    indices = list(range(len(tokens)))
-    rng.shuffle(indices)
-    for i in indices:
-        tok = tokens[i]
-        m = re.match(r"^([^A-Za-z0-9]*)([A-Za-z][A-Za-z\-']*)([^A-Za-z0-9]*)$", tok)
-        if not m:
-            continue
-        prefix, core, suffix = m.groups()
-        if len(core) < 3:
-            continue
-        lower = core.lower()
-        syns: List[str] = []
-        for syn in wn.synsets(lower):
-            for lm in syn.lemmas():
-                w = lm.name().replace("_", " ")
-                if w.lower() != lower and w.isascii():
-                    syns.append(w)
-        if not syns:
-            continue
-        rep = rng.choice(syns)
-        if core[0].isupper():
-            rep = rep[:1].upper() + rep[1:] if len(rep) > 1 else rep.upper()
-        tokens[i] = prefix + rep + suffix
-        return " ".join(tokens)
-    return text
-
-
-# --- Marian back-translation (lightweight seq2seq) ------------------------------
-
-class _MarianPivot:
-    """Round-trip translate through a pivot language to paraphrase English text."""
-
-    def __init__(self, en_pivot_model: str, pivot_en_model: str, device: str):
-        self._en_pivot_model_name = en_pivot_model
-        self._pivot_en_model_name = pivot_en_model
-        self.device = device
-        self._en_pivot_model = None
-        self._en_pivot_tok = None
-        self._pivot_en_model = None
-        self._pivot_en_tok = None
-
-    def _load_pair(self):
-        if self._en_pivot_model is not None:
-            return
-        from transformers import MarianMTModel, MarianTokenizer
-
-        self._en_pivot_tok = MarianTokenizer.from_pretrained(self._en_pivot_model_name)
-        self._en_pivot_model = MarianMTModel.from_pretrained(self._en_pivot_model_name)
-        self._en_pivot_model.to(self.device).eval()
-
-        self._pivot_en_tok = MarianTokenizer.from_pretrained(self._pivot_en_model_name)
-        self._pivot_en_model = MarianMTModel.from_pretrained(self._pivot_en_model_name)
-        self._pivot_en_model.to(self.device).eval()
-
-    @staticmethod
-    def _gen(model, tokenizer, text: str, device: str) -> str:
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
-        with torch.no_grad():
-            out_ids = model.generate(**enc, max_length=512, num_beams=4, early_stopping=True)
-        return tokenizer.decode(out_ids[0], skip_special_tokens=True)
-
-    def round_trip(self, text: str) -> str:
-        if not text.strip():
-            return text
-        self._load_pair()
-        mid = self._gen(self._en_pivot_model, self._en_pivot_tok, text, self.device)
-        if not mid.strip():
-            return text
-        back = self._gen(self._pivot_en_model, self._pivot_en_tok, mid, self.device)
-        return back.strip() or text
-
-
-# --- Defense --------------------------------------------------------------------
 
 class SemanticSmoothLLM(defenses.Defense):
     """
@@ -202,19 +56,19 @@ class SemanticSmoothLLM(defenses.Defense):
         self.translate_device = translate_device
         self._rng = random.Random(seed)
 
-        self._bt_fr = _MarianPivot(
+        self._bt_fr = language_models.MarianPivot(
             "Helsinki-NLP/opus-mt-en-fr",
             "Helsinki-NLP/opus-mt-fr-en",
             translate_device,
         )
-        self._bt_de = _MarianPivot(
+        self._bt_de = language_models.MarianPivot(
             "Helsinki-NLP/opus-mt-en-de",
             "Helsinki-NLP/opus-mt-de-en",
             translate_device,
         )
 
         self._methods: List[Callable[[str], str]] = [
-            lambda t: _synonym_perturb(t, self._rng),
+            lambda t: language_models.synonym_perturb(t, self._rng),
             lambda t: self._bt_fr.round_trip(t),
             lambda t: self._bt_de.round_trip(t),
         ]
@@ -258,30 +112,13 @@ class SemanticSmoothLLM(defenses.Defense):
         return random.choice(majority_outputs)
 
 
-def _pick_device(for_translate: str) -> str:
-    if for_translate == "cuda" and torch.cuda.is_available():
-        return "cuda:0"
-    if for_translate == "cuda" and not torch.cuda.is_available():
-        return "cpu"
-    return for_translate
-
-
-def _run_defense_loop(defense: defenses.Defense, attack_prompts, desc: str) -> List[bool]:
-    jailbroken_results: List[bool] = []
-    for prompt in tqdm(attack_prompts, desc=desc):
-        output = defense(prompt)
-        jb = defense.is_jailbroken(output)
-        jailbroken_results.append(jb)
-    return jailbroken_results
-
-
-def main(args):
+def run_semantic_experiment(args) -> None:
     os.makedirs(args.results_dir, exist_ok=True)
 
-    lm_device = _pick_device(args.llm_device)
-    tr_device = _pick_device(args.translate_device)
+    lm_device = language_models.pick_device(args.llm_device)
+    tr_device = language_models.pick_device(args.translate_device)
 
-    config = model_configs.MODELS[args.target_model]
+    config = model_configs.get_models()[args.target_model]
     target_model = language_models.LLM(
         model_path=config["model_path"],
         tokenizer_path=config["tokenizer_path"],
@@ -299,7 +136,7 @@ def main(args):
 
     if args.defense in ("semantic", "both"):
         print("Prefetching Marian checkpoints (reduces HTTP 503 during first load)...", flush=True)
-        _prefetch_hf_snapshots(MARIAN_REPO_IDS)
+        language_models.prefetch_hf_snapshots()
 
         defense_sem = SemanticSmoothLLM(
             target_model=target_model,
@@ -307,7 +144,9 @@ def main(args):
             translate_device=tr_device,
             seed=args.seed,
         )
-        jb_sem = _run_defense_loop(defense_sem, attack_prompts, "semantic smoothing")
+        jb_sem = language_models.run_defense_over_prompts(
+            defense_sem, attack_prompts, "semantic smoothing"
+        )
         rows.append(
             {
                 "Defense": "SemanticSmoothLLM",
@@ -326,7 +165,9 @@ def main(args):
             pert_pct=args.smoothllm_pert_pct,
             num_copies=args.num_copies,
         )
-        jb_sl = _run_defense_loop(defense_sl, attack_prompts, "SmoothLLM (random)")
+        jb_sl = language_models.run_defense_over_prompts(
+            defense_sl, attack_prompts, "SmoothLLM (random)"
+        )
         rows.append(
             {
                 "Defense": "SmoothLLM",
@@ -353,8 +194,7 @@ def main(args):
     print(f"Wrote {out_path}")
 
 
-def build_arg_parser():
-    p = argparse.ArgumentParser(description="Semantic Smoothing evaluation (SmoothLLM-style voting).")
+def add_semantic_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--results_dir", type=str, default="./results_semantic")
     p.add_argument("--trial", type=int, default=0)
     p.add_argument(
@@ -368,11 +208,10 @@ def build_arg_parser():
         "--target_model",
         type=str,
         default="mistral",
-        choices=list(model_configs.MODELS.keys()),
-        help="Use mistral (local path in lib/model_configs.py) for the target LLM.",
+        choices=list(model_configs.get_models().keys()),
+        help="Target LLM id (see lib/model_configs.py or PROMPT_AIRLOCK_CONFIG).",
     )
     p.add_argument("--attack", type=str, default="GCG", choices=["GCG", "PAIR"])
-    # Behaviors: Vicuna GCG log only for this project iteration.
     p.add_argument(
         "--attack_logfile",
         type=str,
@@ -406,7 +245,7 @@ def build_arg_parser():
         type=str,
         default="cuda",
         choices=["cuda", "cpu"],
-        help="Device for Mistral (default: cuda if available).",
+        help="Device for target LLM (default: cuda if available).",
     )
     p.add_argument(
         "--translate_device",
@@ -416,10 +255,15 @@ def build_arg_parser():
         help="Marian back-translation runs here; default cpu to save VRAM for Mistral.",
     )
     p.add_argument("--seed", type=int, default=0)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Semantic Smoothing evaluation (SmoothLLM-style voting).")
+    add_semantic_arguments(p)
     return p
 
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()
     parser = build_arg_parser()
-    main(parser.parse_args())
+    run_semantic_experiment(parser.parse_args())

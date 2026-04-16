@@ -6,3 +6,7 @@ llm-attacks/
 data/PAIR
 plotting/
 smoothing_ASR.png
+
+# Local unified config (PROMPT_AIRLOCK_CONFIG); keep secrets/paths out of git
+*.local.yaml
+.env.local

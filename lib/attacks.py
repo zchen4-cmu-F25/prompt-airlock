@@ -1,6 +1,9 @@
 import json
 import pandas as pd
 
+__all__ = ["Prompt", "Attack", "GCG", "PAIR"]
+
+
 class Prompt:
     def __init__(self, full_prompt, perturbable_prompt, max_new_tokens):
         self.full_prompt = full_prompt
