@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import os
+import random
 import sys
 
 import numpy as np
@@ -29,13 +30,13 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 def run_smoothllm(args) -> None:
     os.makedirs(args.results_dir, exist_ok=True)
 
-    lm_device = language_models.pick_device(args.llm_device)
+    device = language_models.auto_device()
     config = model_configs.get_models()[args.target_model]
     target_model = language_models.LLM(
         model_path=config["model_path"],
         tokenizer_path=config["tokenizer_path"],
         conv_template_name=config["conversation_template"],
-        device=lm_device,
+        device=device,
     )
 
     defense = defenses.SmoothLLM(
@@ -43,6 +44,7 @@ def run_smoothllm(args) -> None:
         pert_type=args.smoothllm_pert_type,
         pert_pct=args.smoothllm_pert_pct,
         num_copies=args.smoothllm_num_copies,
+        detector=args.smoothllm_detector,
     )
 
     attack = vars(attacks)[args.attack](
@@ -50,23 +52,31 @@ def run_smoothllm(args) -> None:
         target_model=target_model,
     )
 
-    jailbroken_results = []
+    classifications = []
     for i, prompt in tqdm(enumerate(attack.prompts)):
         output = defense(prompt)
-        jb = defense.is_jailbroken(output)
-        jailbroken_results.append(jb)
+        label = defense.classify_output(output)
+        classifications.append(label)
+
+    n_total = len(classifications)
+    n_refusal = classifications.count('refusal')
+    n_confusion = classifications.count('confusion')
+    n_jailbreak = classifications.count('jailbreak')
 
     summary_df = pd.DataFrame.from_dict({
-        "Number of smoothing copies": [args.smoothllm_num_copies],
-        "Perturbation type": [args.smoothllm_pert_type],
-        "Perturbation percentage": [args.smoothllm_pert_pct],
-        "JB percentage": [np.mean(jailbroken_results) * 100],
-        "Trial index": [args.trial],
+        'Number of smoothing copies': [args.smoothllm_num_copies],
+        'Perturbation type': [args.smoothllm_pert_type],
+        'Perturbation percentage': [args.smoothllm_pert_pct],
+        'Detector': [args.smoothllm_detector],
+        'Trial index': [args.trial],
+        'Refusal %': [n_refusal / n_total * 100 if n_total else 0],
+        'Confusion %': [n_confusion / n_total * 100 if n_total else 0],
+        'Jailbreak %': [n_jailbreak / n_total * 100 if n_total else 0],
     })
     summary_df.to_pickle(os.path.join(
         args.results_dir, "summary.pd"
     ))
-    print(summary_df)
+    print(summary_df.to_string())
 
 
 def run_smoke(_args) -> None:
@@ -74,7 +84,7 @@ def run_smoke(_args) -> None:
     Fast regression check: imports and config resolution (no GPU, no model load).
     Intended for CI: ``python main.py smoke`` after ``pip install -r requirements.txt``.
     """
-    del _args  # reserved for future flags
+    del _args
     failures: list[str] = []
     for mod in (
         "lib.model_configs",
@@ -132,24 +142,23 @@ def _add_smoothllm_arguments(p) -> None:
         ],
     )
     p.add_argument(
-        "--llm_device",
+        "--smoothllm_detector",
         type=str,
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="Device for the target LLM (cuda maps to cuda:0 when available).",
+        default="three_class",
+        choices=["binary", "three_class"],
     )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prompt-airlock evaluations (SmoothLLM baseline, semantic smoothing, smoke).",
+        description="SmoothLLM + Semantic Smoothing evaluations.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_smooth = sub.add_parser("smoothllm", help="Character-level SmoothLLM defense (original main).")
+    p_smooth = sub.add_parser("smoothllm", help="Character-level SmoothLLM defense.")
     _add_smoothllm_arguments(p_smooth)
 
-    p_sem = sub.add_parser("semantic", help="Semantic smoothing / SmoothLLM comparison (see semantic_smoothing).")
+    p_sem = sub.add_parser("semantic", help="Semantic smoothing / SmoothLLM comparison.")
     semantic_smoothing.add_semantic_arguments(p_sem)
 
     sub.add_parser("smoke", help="Import and config smoke test (CI-friendly, no GPU).")
@@ -163,6 +172,9 @@ def main() -> None:
     args = parser.parse_args(argv)
 
     if args.cmd == "smoothllm":
+        torch.manual_seed(args.trial)
+        random.seed(args.trial)
+        np.random.seed(args.trial)
         run_smoothllm(args)
     elif args.cmd == "semantic":
         semantic_smoothing.run_semantic_experiment(args)

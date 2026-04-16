@@ -18,7 +18,7 @@ Legacy:
 Compare semantic vs. character-level SmoothLLM (same copy count):
     python main.py semantic --defense both --results_dir ./results_semantic --target_model mistral
 
-See lib/model_configs.py (MARK: prompt-airlock) for paths; use PROMPT_AIRLOCK_CONFIG or env overrides.
+See lib/model_configs.py for paths; use PROMPT_AIRLOCK_CONFIG or env overrides.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ class SemanticSmoothLLM(defenses.Defense):
 
     @torch.no_grad()
     def __call__(self, prompt, batch_size: int = 64, max_new_len: int = 100):
-        del max_new_len  # API parity with SmoothLLM; generation uses prompt.max_new_tokens
+        del max_new_len
 
         base_pert = prompt.perturbable_prompt
         base_full = prompt.full_prompt
@@ -252,7 +252,7 @@ def add_semantic_arguments(p: argparse.ArgumentParser) -> None:
         type=str,
         default="cpu",
         choices=["cuda", "cpu"],
-        help="Marian back-translation runs here; default cpu to save VRAM for Mistral.",
+        help="Marian back-translation runs here; default cpu to save VRAM.",
     )
     p.add_argument("--seed", type=int, default=0)
 

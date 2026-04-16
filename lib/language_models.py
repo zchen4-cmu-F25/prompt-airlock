@@ -15,7 +15,7 @@ import lib.model_configs as model_configs
 
 
 def configure_hf_hub_env() -> None:
-    """Hugging Face Hub defaults; call before transformers/huggingface_hub use (esp. Windows)."""
+    """Hugging Face Hub defaults; call before transformers/huggingface_hub use."""
     if sys.platform == "win32":
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -150,12 +150,26 @@ class MarianPivot:
         return back.strip() or text
 
 
-def pick_device(for_translate: str) -> str:
-    if for_translate == "cuda" and torch.cuda.is_available():
+def pick_device(preference: str = "cuda") -> str:
+    """Resolve device preference to an actual available device, with MPS fallback."""
+    if preference == "cuda" and torch.cuda.is_available():
         return "cuda:0"
-    if for_translate == "cuda" and not torch.cuda.is_available():
+    if preference == "mps" and torch.backends.mps.is_available():
+        return "mps"
+    if preference == "cuda" and not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            return "mps"
         return "cpu"
-    return for_translate
+    return preference
+
+
+def auto_device() -> str:
+    """Auto-detect best device: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def run_defense_over_prompts(defense, attack_prompts, desc: str) -> List[bool]:
@@ -181,19 +195,25 @@ class LLM:
         device
     ):
 
-        # Language model
-        # MARK: prompt-airlock — prefer `dtype` (transformers>=4.42); fallback for older versions
-        _load_kw = dict(trust_remote_code=True, low_cpu_mem_usage=True, use_cache=True)
+        use_cuda = device.startswith('cuda')
+        use_mps = device == 'mps'
+
+        _load_kw = dict(
+            trust_remote_code=True,
+            low_cpu_mem_usage=use_cuda,
+            use_cache=True,
+        )
+        _dtype = torch.float16 if (use_cuda or use_mps) else torch.float32
+
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_path, dtype=torch.float16, **_load_kw
+                model_path, dtype=_dtype, **_load_kw
             ).to(device).eval()
         except TypeError:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_path, torch_dtype=torch.float16, **_load_kw
+                model_path, torch_dtype=_dtype, **_load_kw
             ).to(device).eval()
 
-        # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
             trust_remote_code=True,
@@ -205,7 +225,6 @@ class LLM:
         if not self.tokenizer.pad_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Fastchat conversation template
         self.conv_template = get_conversation_template(
             conv_template_name
         )
@@ -214,7 +233,6 @@ class LLM:
 
     def __call__(self, batch, max_new_tokens=100):
 
-        # Pass current batch through the tokenizer
         batch_inputs = self.tokenizer(
             batch,
             padding=True,
@@ -224,17 +242,16 @@ class LLM:
         batch_input_ids = batch_inputs['input_ids'].to(self.model.device)
         batch_attention_mask = batch_inputs['attention_mask'].to(self.model.device)
 
-        # Forward pass through the LLM
         try:
             outputs = self.model.generate(
                 batch_input_ids,
                 attention_mask=batch_attention_mask,
-                max_new_tokens=max_new_tokens
+                max_new_tokens=max_new_tokens,
+                do_sample=False
             )
         except RuntimeError:
             return []
 
-        # Decode the outputs produced by the LLM
         batch_outputs = self.tokenizer.batch_decode(
             outputs,
             skip_special_tokens=True
